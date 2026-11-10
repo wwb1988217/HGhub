@@ -1,0 +1,177 @@
+# 安卓 APK 一键构建（自编译用）
+#
+# 用法：Fork 本仓库 → Actions → Build Android APK → Run workflow。
+# 无需配置任何 Secret 即可出包：每次运行会临时生成一个 debug 密钥并签名，
+# 产物在该次运行的 Artifacts 里下载（HGhub-android-*）。
+#
+# 注意：临时密钥每次都不同，两次构建的 APK 签名不一致，覆盖安装会失败，
+# 需要先卸载旧版。若希望签名长期固定，在仓库 Settings → Secrets 里配置以下
+# 四项（可选），工作流会自动优先复用：
+#   ANDROID_DEBUG_KEYSTORE_BASE64   keystore 文件的 base64（base64 -w0 release.keystore）
+#   ANDROID_DEBUG_KEY_ALIAS         密钥别名，默认 androiddebugkey
+#   ANDROID_DEBUG_KEYSTORE_PASSWORD 库密码，默认 android
+#   ANDROID_DEBUG_KEY_PASSWORD      密钥密码，默认 android
+#   ANDROID_DEBUG_KEYSTORE_TYPE     密钥库类型，默认 PKCS12；若你手上是老式 .jks 填 JKS
+#
+# 本工作流只从当前仓库源码构建，不下载任何外部可执行程序。产物仅供个人
+# 学习研究与非商业自用，请遵守项目许可证及适用法律法规，勿分发。
+
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: '要编译的 ABI（Tauri target 名，空格分隔）'
+        required: false
+        default: 'aarch64 armv7 x86_64'
+        type: string
+      create_release:
+        description: '同时发布到本 Fork 的 Releases'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  android:
+    name: Android (self-built APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: ver
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          ls "$SDK/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-selfbuilt
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 生成安卓工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK（按 ABI 分包）
+        env:
+          ABIS: ${{ inputs.abis }}
+        run: |
+          set -euo pipefail
+          read -r -a T <<< "${ABIS:-aarch64 armv7 x86_64}"
+          echo "构建目标: ${T[*]}"
+          pnpm tauri android build --apk --split-per-abi --target "${T[@]}"
+
+      - name: 生成密钥、对齐并签名 APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
+          STORE_PASS: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
+          KS_TYPE: ${{ secrets.ANDROID_DEBUG_KEYSTORE_TYPE }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # JDK 17 的 keytool 默认产出 PKCS12，显式指定类型与扩展名，避免 apksigner 误判为 JKS
+          KS="$RUNNER_TEMP/hghub-debug.p12"
+          KST="${KS_TYPE:-PKCS12}"
+          ALIAS="${KEY_ALIAS:-androiddebugkey}"
+          SP="${STORE_PASS:-android}"
+          KP="${KEY_PASS:-android}"
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "复用仓库 Secrets 中的固定签名密钥（$KST）"
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+          else
+            echo "本次运行生成临时 debug 密钥（仅用于安装，勿用于发布）"
+            KP="$SP"
+            keytool -genkeypair -storetype PKCS12 -keystore "$KS" \
+              -storepass "$SP" -keypass "$KP" \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=HGhub Self-Built, OU=Debug, O=HGhub, L=NA, S=NA, C=US"
+            KST="PKCS12"
+          fi
+
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BT/zipalign"
+          mkdir -p artifacts
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build/outputs/apk \
+            -type f -name '*.apk' ! -path '*/androidTest/*' -print | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::没有找到编译出的 APK"
+            exit 1
+          fi
+          for f in "${APKS[@]}"; do
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            out="artifacts/HGhub_${VERSION}_${abi}_selfbuilt.apk"
+            SRC="$f"
+            if [ -x "$ZIPALIGN" ]; then
+              "$ZIPALIGN" -f -p 4 "$f" "$RUNNER_TEMP/aligned.apk"
+              SRC="$RUNNER_TEMP/aligned.apk"
+            fi
+            "$APKSIGNER" sign --ks "$KS" --ks-type "$KST" --ks-key-alias "$ALIAS" \
+              --ks-pass "pass:$SP" --key-pass "pass:$KP" \
+              --v4-signing-enabled false --out "$out" "$SRC"
+            "$APKSIGNER" verify "$out"
+            echo "已签名: $out"
+          done
+          rm -f "$KS" "$RUNNER_TEMP/aligned.apk"
+          (cd artifacts && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-android-${{ steps.ver.outputs.version }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布到本 Fork 的 Releases
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="android-${VERSION}-run${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" artifacts/* \
+            --title "HGhub Android ${VERSION} (self-built)" \
+            --notes "由本 Fork 源码自行编译，使用临时 debug 密钥签名。仅供个人学习研究与非商业自用，勿分发。"
